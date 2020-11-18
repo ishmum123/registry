@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+
 module Main where
 
 import           Control.Applicative
@@ -17,6 +18,26 @@ type ServiceMap = TVar (M.Map String (TQueue String))
 
 serviceMap :: STM ServiceMap
 serviceMap = newTVar M.empty
+
+getQueue :: ServiceMap -> String -> STM (Maybe (TQueue String))
+getQueue tmap s = readTVar tmap >>= pure . M.lookup s
+
+getServer :: ServiceMap -> String -> STM (Maybe String)
+getServer tmap s = do
+  mq <- getQueue tmap s
+  case mq of 
+    Nothing -> pure Nothing
+    Just tq -> do 
+      ms <- tryReadTQueue tq
+      case ms of 
+        Nothing -> pure Nothing
+        Just s -> writeTQueue tq s >> (pure $ Just s)
+
+getServers :: TQueue String -> STM [String]
+getServers tq = do
+  ss <- flushTQueue tq
+  forM_ ss $ writeTQueue tq
+  pure ss
 
 main :: IO ()
 main = atomically serviceMap >>= quickHttpServe . site
@@ -48,22 +69,28 @@ getServiceHandler tmap = do
   msrvc <- getParam "service"
   case msrvc of 
     Just srvc -> do 
-      smap <- liftIO . atomically $ readTVar tmap
-      mqueue <- pure . flip M.lookup smap $ C8.unpack srvc
-      case mqueue of 
+      ms <- liftIO . atomically . getServer tmap $ C8.unpack srvc
+      case ms of 
         Nothing -> writeBS "No Server for Service Found"
-        Just tqueue -> do
-          ms <- liftIO . atomically $ tryReadTQueue tqueue
-          case ms of 
-            Nothing -> writeBS "No Server for Service Found"
-            Just s -> writeBS $ C8.pack s
+        Just s -> writeBS $ C8.pack s
     Nothing -> writeBS "Please provide a service name"
 
+getAllServers :: ServiceMap -> STM String
+getAllServers tmap = do
+  smap <- readTVar tmap
+  ks <- pure $ M.keys smap
+  vs <- forM ks $ \k -> do
+    case M.lookup k smap of
+      Nothing -> pure ""
+      Just tq -> do 
+        ss <- getServers tq 
+        pure $ k ++ ": " ++ show ss
+  pure $ unlines vs
+
 getAllHandler :: ServiceMap -> Snap ()
-getAllHandler tmap = do
-  ssl <- liftIO . atomically $ readTVar tmap >>= sequence . map mf . M.toList >>= pure . unlines
-  writeBS $ C8.pack ssl
-  where mf (s, tq) = flushTQueue tq >>= pure . (\x -> s ++ ": " ++ show x) 
+getAllHandler tmap = do 
+  ss <- liftIO . atomically $ getAllServers tmap
+  writeBS $ C8.pack ss
 
 site :: ServiceMap -> Snap ()
 site tmap =
