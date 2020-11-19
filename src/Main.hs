@@ -2,36 +2,30 @@
 
 module Main where
 
-import           Control.Applicative
-import           Snap.Core
-import           Snap.Util.FileServe
-import           Snap.Http.Server
-import qualified Data.ByteString.Char8 as C8
-import qualified Data.Map as M
-import           Data.Monoid
-import           Control.Monad
-import           Control.Monad.IO.Class
-import           Control.Concurrent
-import           Control.Concurrent.STM
+import           Snap.Core (Snap, getParam, writeBS, route)
+import           Snap.Http.Server (quickHttpServe)
+import qualified Data.ByteString.Char8 as C8 (pack, unpack, ByteString)
+import qualified Data.Map as M (lookup, insert, empty, keys, Map)
+import           Data.Maybe (maybe)
+import           Control.Monad (forM, forM_)
+import           Control.Monad.IO.Class (liftIO)
+import           Control.Concurrent.STM (flushTQueue, tryReadTQueue, writeTQueue,
+                                         newTQueue, readTVar, writeTVar, newTVar,
+                                         STM, TQueue, TVar, atomically)
 
-type ServiceMap = TVar (M.Map String (TQueue String))
+type ServiceMap = M.Map String (TQueue String)
+type TServiceMap = TVar ServiceMap
 
-serviceMap :: STM ServiceMap
+serviceMap :: STM TServiceMap
 serviceMap = newTVar M.empty
 
-getQueue :: ServiceMap -> String -> STM (Maybe (TQueue String))
+getQueue :: TServiceMap -> String -> STM (Maybe (TQueue String))
 getQueue tmap s = readTVar tmap >>= pure . M.lookup s
 
-getServer :: ServiceMap -> String -> STM (Maybe String)
-getServer tmap s = do
-  mq <- getQueue tmap s
-  case mq of 
-    Nothing -> pure Nothing
-    Just tq -> do 
-      ms <- tryReadTQueue tq
-      case ms of 
-        Nothing -> pure Nothing
-        Just s -> writeTQueue tq s >> (pure $ Just s)
+getServer :: TServiceMap -> String -> STM (Maybe String)
+getServer tmap srvc = getQueue tmap srvc >>=
+  maybe (pure Nothing) (\tq -> tryReadTQueue tq >>=
+    maybe (pure Nothing) (\s -> writeTQueue tq s >> (pure $ Just s)))
 
 getServers :: TQueue String -> STM [String]
 getServers tq = do
@@ -42,74 +36,51 @@ getServers tq = do
 main :: IO ()
 main = atomically serviceMap >>= quickHttpServe . site
 
-modify :: ServiceMap -> String -> String -> STM ()
+modify :: TServiceMap -> String -> String -> STM ()
 modify tmap srvc srvr = do
   smap <- readTVar tmap
-  tqueue <- case M.lookup srvc smap of 
-              Just q -> pure q 
-              Nothing -> newTQueue
+  tqueue <- maybe newTQueue pure $ M.lookup srvc smap
   writeTQueue tqueue srvr
   writeTVar tmap $ M.insert srvc tqueue smap
 
-addServiceHandler :: ServiceMap -> Snap ()
-addServiceHandler tmap = do
-  msrvc <- getParam "service"
-  msrvr <- getParam "server"
-  case msrvc of 
-    Just srvc -> do
-      case msrvr of
-        Just srvr -> do 
-          liftIO . atomically . modify tmap (C8.unpack srvc) $ C8.unpack srvr
-          writeBS "Successfully Added!" 
-        Nothing -> writeBS "Please pass in a server name"
-    Nothing -> writeBS "Please pass in a service name"
+addServiceHandler :: TServiceMap -> Snap ()
+addServiceHandler tmap = getParam "service" >>= maybe (writeBS "Please pass in a service name")
+    (\srvc -> getParam "server" >>= maybe (writeBS "Please pass in a server name") (addService tmap srvc))
 
-getServiceHandler :: ServiceMap -> Snap ()
-getServiceHandler tmap = do
-  msrvc <- getParam "service"
-  case msrvc of 
-    Just srvc -> do 
-      ms <- liftIO . atomically . getServer tmap $ C8.unpack srvc
-      case ms of 
-        Nothing -> writeBS "No Server for Service Found"
-        Just s -> writeBS $ C8.pack s
-    Nothing -> writeBS "Please provide a service name"
+addService :: TServiceMap -> C8.ByteString -> C8.ByteString -> Snap ()
+addService tmap srvc srvr = do
+  liftIO . atomically . modify tmap (C8.unpack srvc) $ C8.unpack srvr
+  writeBS "Successfully Added!"
+
+getServiceHandler :: TServiceMap -> Snap ()
+getServiceHandler tmap = getParam "service" >>=
+  maybe (pure "Please provide a service name") (flip serverName tmap) >>=
+  writeBS
+
+serverName' :: C8.ByteString -> TServiceMap -> STM C8.ByteString
+serverName' srvc tmap = (getServer tmap $ C8.unpack srvc) >>=
+   pure . maybe ("No Server for Service Found") C8.pack
+
+serverName :: C8.ByteString -> TServiceMap -> Snap C8.ByteString
+serverName s = liftIO . atomically . serverName' s
 
 getAllServers :: ServiceMap -> STM String
-getAllServers tmap = do
-  smap <- readTVar tmap
-  ks <- pure $ M.keys smap
-  vs <- forM ks $ \k -> do
-    case M.lookup k smap of
-      Nothing -> pure ""
-      Just tq -> do 
-        ss <- getServers tq 
-        pure $ k ++ ": " ++ show ss
-  pure $ unlines vs
+getAllServers smap = pure (M.keys smap) >>=
+  flip forM (getServersForService smap) >>=
+  pure . unlines
 
-getAllHandler :: ServiceMap -> Snap ()
-getAllHandler tmap = do 
-  ss <- liftIO . atomically $ getAllServers tmap
-  writeBS $ C8.pack ss
+getServersForService :: M.Map String (TQueue String) -> String -> STM String
+getServersForService smap k = maybe (pure "") concatServers (M.lookup k smap)
+  where concatServers tq = getServers tq >>= pure . ((++) (k ++ ": ")) . show
 
-site :: ServiceMap -> Snap ()
+getAllHandler :: TServiceMap -> Snap ()
+getAllHandler tmap = pure (readTVar tmap) >>=
+  liftIO . atomically . (flip (>>=) getAllServers) >>=
+  writeBS . C8.pack
+
+site :: TServiceMap -> Snap ()
 site tmap =
     route [ ("add/:service/:server", addServiceHandler tmap)
           , ("get/:service", getServiceHandler tmap)
           , ("get-all", getAllHandler tmap)
-          ] 
-
-{- site :: ServiceMap -> Snap ()
-site tmap =
-    ifTop (writeBS "hello world") <|>
-    route [ ("foo", writeBS "bar")
-          , ("echo/:echoparam", echoHandler)
-          , ("add/:service", addServiceHandler)
-          ] <|>
-    dir "static" (serveDirectory ".") -}
-
-echoHandler :: Snap ()
-echoHandler = do
-    param <- getParam "echoparam"
-    maybe (writeBS "must specify echo/param in URL")
-          writeBS param
+          ]
